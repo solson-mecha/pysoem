@@ -1332,6 +1332,74 @@ cdef class CdefSlave:
             else:
                 raise AttributeError()
 
+    def set_sync_managers(self, inputs=None, outputs=None):
+        """Set the process data size of each sync manager.
+
+        Use this for a slave whose SII does not match its process data and that has no CoE or SoE mapping.
+        Call it in the slave's setup_func or config_func. config_map() then maps the listed sync managers in
+        index order and does not read the mapping from CoE, SoE, or the SII. config_map() disables every other
+        process data sync manager. The start address and direction of each sync manager come from the SII. The
+        sizes stay set until the next config_init().
+
+        .. warning:: This is experimental.
+
+        :param dict inputs: Sync manager index -> length in bytes, for sync managers the master reads,
+            e.g. ``{0: 8, 1: 8}``.
+        :param dict outputs: Sync manager index -> length in bytes, for sync managers the master writes.
+
+        .. versionadded:: 1.1.14
+        """
+        # Bits 0-7 of SMflags are the control byte and bits 16-23 are the activate byte. Activate bit 0 enables
+        # the sync manager.
+        cdef int sm_enable = 0x00010000
+        inputs = dict(inputs or {})
+        outputs = dict(outputs or {})
+        if not inputs and not outputs:
+            raise ValueError('no sync managers given')
+        # Bits 3:2 of the SII control byte are the direction. 0 means the master reads, 1 means the master writes.
+        for sms, direction, kind in ((inputs, 0, 'input'), (outputs, 1, 'output')):
+            for nsm, length in sms.items():
+                if not 0 <= nsm < cpysoem.EC_MAXSM or not self._ec_slave.SM[nsm].StartAddr:
+                    raise ValueError('sync manager {} is not in the SII'.format(nsm))
+                if self._is_mailbox_sync_manager(nsm) or (self._ec_slave.SM[nsm].SMflags >> 2) & 0x3 != direction:
+                    raise ValueError('sync manager {} is not an {} process data sync manager'.format(nsm, kind))
+                if length <= 0:
+                    raise ValueError('sync manager {} needs a positive length, got {}'.format(nsm, length))
+        # config_map() assigns one FMMU to each sync manager and does not limit the count. The size check keeps
+        # this slave inside the IO map. It does not check the total over all slaves.
+        if len(inputs) + len(outputs) > cpysoem.EC_MAXFMMU:
+            raise ValueError('more than {} sync managers given'.format(cpysoem.EC_MAXFMMU))
+        if sum(inputs.values()) + sum(outputs.values()) > EC_IOMAPSIZE:
+            raise ValueError('more than {} bytes of process data'.format(EC_IOMAPSIZE))
+
+        for nsm in range(cpysoem.EC_MAXSM):
+            if self._is_mailbox_sync_manager(nsm):
+                continue
+            if nsm in inputs:
+                length, sm_type = inputs[nsm], 4
+            elif nsm in outputs:
+                length, sm_type = outputs[nsm], 3
+            else:
+                length, sm_type = 0, 0
+            self._ec_slave.SM[nsm].SMlength = length
+            self._ec_slave.SMtype[nsm] = sm_type
+            if length:
+                self._ec_slave.SM[nsm].SMflags |= sm_enable
+            else:
+                self._ec_slave.SM[nsm].SMflags &= ~sm_enable
+        self._ec_slave.Ibits = sum(inputs.values()) * 8
+        self._ec_slave.Obits = sum(outputs.values()) * 8
+        # config_map() reads the mapping from CoE, SoE, or the SII only for a slave with configindex 0, and resets
+        # Ibits and Obits for that slave (ecx_map_coe_soe). A non-zero configindex normally means SOEM found the
+        # slave in its config table. pysoem does not use that table, so a non-zero value only stops config_map()
+        # from replacing this mapping.
+        self._ec_slave.configindex = 1
+
+    cdef bint _is_mailbox_sync_manager(self, int nsm):
+        """True if the SII control byte (SMflags bits 1:0) or SOEM's mailbox setup marks sync manager nsm as a
+        mailbox."""
+        return (self._ec_slave.SM[nsm].SMflags & 0x3) == 0x2 or self._ec_slave.SMtype[nsm] in (1, 2)
+
     def set_watchdog(self, wd_type, wd_time_ms):
         """Change the watchdog time of the PDI or Process Data watchdog.
 
